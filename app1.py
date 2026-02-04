@@ -224,10 +224,12 @@ def whatsapp_webhook():
     
     # Cargar estado del usuario e idioma
     user = get_user(from_number_clean)
-    lang = user.get("lang") or "es"
-    if lang not in ["es", "en", "fr"]:
+    # lang = user.get("lang") or "es"
+    # if lang not in ["es", "en", "fr"]:
+    #     lang = "es"
+    lang = user.get("lang")
+    if not lang:
         lang = "es"
-
     resp = MessagingResponse()
     created_at = datetime.now()
 
