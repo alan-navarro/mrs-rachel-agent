@@ -304,11 +304,22 @@ def whatsapp_webhook():
         return str(resp), 200
 
     # CASO 2: MENSAJE DE TEXTO NORMAL
+# --- LÓGICA DE TEXTO SEGURA ---
     key = route_message(message_text, user)
-    lang = user.get("lang", "es") # Actualizar lang por si route_message lo cambió
-
-    # Enviar respuesta predefinida
-    resp.message(RESPONSES[key][lang])
+    
+    # 1. Aseguramos que lang nunca sea None
+    lang = user.get("lang")
+    if not lang:
+        lang = "es"
+    
+    # 2. Aseguramos que la respuesta exista para esa combinación
+    try:
+        texto_final = RESPONSES[key][lang]
+    except KeyError:
+        # Si falla, intentamos español, y si no, un mensaje genérico
+        texto_final = RESPONSES.get(key, {}).get("es", "Lo siento, hubo un error de configuración.")
+    
+    resp.message(texto_final)
 
     # Acciones especiales según la "key" resultante
     if key == "TRANSFER":
