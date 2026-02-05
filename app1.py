@@ -213,37 +213,52 @@ bp = "\n"*3
 
 @app.route("/webhook_whatsapp", methods=["POST"])
 def whatsapp_webhook():
+    # --- CHIVATO DE DEPLOY ---
+    print("\n" + "="*30)
+    print("⚡ VERSIÓN: FIX UNBOUND LOCAL ERROR ⚡")
+    print("="*30 + "\n")
+
     data = request.form.to_dict()
     from_number_clean = data.get("From", "").replace("whatsapp:+", "")
     message_text = data.get("Body", "").strip()
     num_media = int(data.get("NumMedia", 0))
-    
-    # 1. RECUPERACIÓN DE ESTADO (MEMORIA)
+
+    # 1. INICIALIZACIÓN SEGURA (Esto arregla tu error 500)
+    # Definimos lang y user por defecto ANTES de cualquier lógica
     user = get_user(from_number_clean)
     if not user:
         user = {"lang": "es", "step": "LANG"}
-
-    # 2. SINCRONIZACIÓN DE IDIOMA (BD - FUENTE DE VERDAD)
-    new_lang_selection = None
-    # Si el usuario está en paso de elegir idioma, capturamos su selección
-    if user.get("step") == "LANG":
-        mapping = {"1": "es", "2": "en", "3": "fr"}
-        new_lang_selection = mapping.get(message_text)
-
-    # Consultamos/Actualizamos la BD
-    db_lang = PullShopify().manage_user_language(from_number_clean, new_lang_selection)
-    print(f"DEBUG: Idioma recuperado de BD para {from_number_clean} es {lang}")
-    # Normalizamos el idioma (si es undefined -> español)
-    lang = "es" if db_lang == "undefined" else db_lang
     
-    # IMPORTANTE: Forzamos el idioma en el diccionario 'user' 
-    # para que route_message y RESPONSES lo usen correctamente
-    user["lang"] = lang 
+    # Asignamos un valor por defecto para evitar el UnboundLocalError
+    lang = user.get("lang") or "es" 
+
+    # 2. LÓGICA DE BASE DE DATOS
+    try:
+        new_lang_selection = None
+        if user.get("step") == "LANG":
+            mapping = {"1": "es", "2": "en", "3": "fr"}
+            new_lang_selection = mapping.get(message_text)
+
+        # Consultamos la BD
+        db_lang = PullShopify().manage_user_language(from_number_clean, new_lang_selection)
+        
+        # Actualizamos la variable lang con lo que dijo la BD
+        if db_lang != "undefined":
+            lang = db_lang
+            
+        # Sincronizamos el diccionario user
+        user["lang"] = lang
+        
+        # AHORA SÍ es seguro imprimir, porque lang ya existe
+        print(f"DEBUG: Idioma recuperado de BD para {from_number_clean} es {lang}")
+
+    except Exception as e:
+        print(f"⚠️ Error recuperando idioma de BD: {e}. Usando fallback: {lang}")
 
     resp = MessagingResponse()
 
     # ------------------------------------------------
-    # LÓGICA PARA EL ADMIN
+    # LÓGICA PARA EL ADMIN (Confirmación de Pagos)
     # ------------------------------------------------
     if from_number_clean == ADMIN_NUMBER:
         if message_text.isdigit():
@@ -251,7 +266,7 @@ def whatsapp_webhook():
             try:
                 recovered_phone = PullShopify().confirm_discount_code(code_id)
                 
-                # Buscamos el idioma del cliente en la BD
+                # Buscamos idioma del cliente
                 c_lang_db = PullShopify().manage_user_language(str(recovered_phone))
                 c_lang = "es" if c_lang_db == "undefined" else c_lang_db
 
@@ -268,17 +283,15 @@ def whatsapp_webhook():
                 tw_client.messages.create(from_=tw_from, to=tw_to, body=f"🎫 *{new_coupon}*")
                 tw_client.messages.create(from_=tw_from, to=tw_to, body=RESPONSES["END"][c_lang])
                 
-                print(f"✅ Cupón {new_coupon} enviado a {recovered_phone} en idioma: {c_lang}")
+                print(f"✅ Cupón {new_coupon} enviado a {recovered_phone}")
             except Exception as e:
-                print(f"❌ ERROR EN ENVÍO DE CUPÓN: {e}")
-        
+                print(f"❌ ERROR ADMIN: {e}")
         return "OK", 200
 
     # ------------------------------------------------
     # LÓGICA PARA EL CLIENTE
     # ------------------------------------------------
     
-    # Manejo de imágenes
     if num_media > 0:
         discount_id = "N/A"
         try:
@@ -289,16 +302,15 @@ def whatsapp_webhook():
                          args=(from_number_clean, num_media, data, discount_id)).start()
 
         msg_key = "TRANSFER_PROOF_RECEIVED" if user.get("step") == "WAITING_TRANSFER_PROOF" else "WELCOME"
-        resp.message(RESPONSES.get(msg_key, {}).get(lang, "Gracias por tu mensaje."))
+        resp.message(RESPONSES.get(msg_key, {}).get(lang, "Gracias.")) # lang ya es seguro aquí
         user["step"] = "WAITING_ADMIN_CONFIRMATION"
         return str(resp), 200
 
-    # Manejo de texto
     try:
-        # Aquí 'user' ya lleva el 'lang' correcto inyectado desde la BD
+        # Pasamos el user actualizado (que ya tiene el lang de la BD)
         key = route_message(message_text, user)
         
-        # Si route_message cambió el idioma internamente, lo respetamos
+        # Re-verificamos lang por si route_message lo cambió internamente
         lang = user.get("lang", lang)
 
         if not key or key not in RESPONSES:
@@ -315,8 +327,8 @@ def whatsapp_webhook():
             reset_user(from_number_clean)
 
     except Exception as e:
-        print(f"💥 Error en texto: {e}")
-        resp.message("Lo siento, por favor intenta de nuevo en unos segundos.")
+        print(f"💥 Error Webhook Texto: {e}")
+        resp.message("Error técnico. Reintenta.")
 
     return str(resp), 200
 
