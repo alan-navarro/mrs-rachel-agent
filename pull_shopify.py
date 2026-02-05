@@ -864,60 +864,53 @@ RETURNING phone_number;
             return discount_code
 
         def manage_user_language(self, phone_number, lang_selected=None):
-            """
-            Gestiona el idioma del usuario en la tabla chatbot_interaction.
-            Retorna el idioma actual (el guardado o el recién actualizado).
-            """
-            CONN = create_conn()
-            current_lang = "es" # Default de seguridad
+                CONN = create_conn()
+                current_lang = "undefined" 
+                
+                print(f"🛠️ DB DEBUG: Entrando a manage_user_language para {phone_number}. Selección: {lang_selected}")
         
-            try:
-                with CONN:
-                    with CONN.cursor() as cur:
-                        # 1️⃣ Verificar si el usuario ya existe
-                        check_query = """
-                            SELECT lang 
-                            FROM chatbot_interaction 
-                            WHERE phone_number = %s 
-                            ORDER BY created_at DESC 
-                            LIMIT 1;
-                        """
-                        cur.execute(check_query, (phone_number,))
-                        row = cur.fetchone()
+                try:
+                    cursor = CONN.cursor()
+                    
+                    # 1. Verificar usuario
+                    check_query = "SELECT lang, step FROM chatbot_interaction WHERE phone_number = %s ORDER BY created_at DESC LIMIT 1;"
+                    cursor.execute(check_query, (phone_number,))
+                    row = cursor.fetchone()
         
-                        if not row:
-                            # CASO: Primer mensaje -> Insertamos con lang='undefined'
-                            print(f"🆕 Primer mensaje de {phone_number}. Registrando...")
-                            insert_query = """
-                                INSERT INTO chatbot_interaction (phone_number, lang, step, created_at)
-                                VALUES (%s, 'undefined', 'LANG', NOW());
+                    if not row:
+                        print("🆕 DB DEBUG: Usuario Nuevo. Insertando...")
+                        # Insertamos step inicial como LANG
+                        insert_query = "INSERT INTO chatbot_interaction (phone_number, lang, step, created_at) VALUES (%s, 'undefined', 'LANG', NOW());"
+                        cursor.execute(insert_query, (phone_number,))
+                        CONN.commit()
+                        current_lang = "undefined"
+                    else:
+                        db_lang = row[0]
+                        db_step = row[1]
+                        
+                        # SI EL USUARIO ELIGE UN IDIOMA VÁLIDO (1, 2 o 3)
+                        if lang_selected and lang_selected in ["es", "en", "fr"]:
+                            print(f"✏️ DB DEBUG: Actualizando a {lang_selected} y avanzando paso.")
+                            
+                            # 🔥 CAMBIO CLAVE: Actualizamos LANG y cambiamos STEP a 'WELCOME'
+                            # para que el próximo mensaje ya no se interprete como selección de idioma.
+                            update_query = """
+                                UPDATE chatbot_interaction 
+                                SET lang = %s, step = 'WELCOME' 
+                                WHERE id = (SELECT id FROM chatbot_interaction WHERE phone_number = %s ORDER BY created_at DESC LIMIT 1);
                             """
-                            cur.execute(insert_query, (phone_number,))
-                            current_lang = "undefined"
+                            cursor.execute(update_query, (lang_selected, phone_number))
+                            CONN.commit()
+                            current_lang = lang_selected
                         else:
-                            # CASO: Ya existe. Si recibimos un idioma nuevo, actualizamos el registro más reciente
-                            if lang_selected and lang_selected != "undefined":
-                                print(f"🔄 Actualizando idioma a '{lang_selected}' para {phone_number}")
-                                update_query = """
-                                    UPDATE chatbot_interaction
-                                    SET lang = %s
-                                    WHERE id = (
-                                        SELECT id FROM chatbot_interaction 
-                                        WHERE phone_number = %s 
-                                        ORDER BY created_at DESC 
-                                        LIMIT 1
-                                    );
-                                """
-                                cur.execute(update_query, (lang_selected, phone_number))
-                                current_lang = lang_selected
-                            else:
-                                # Si no hay lang_selected nuevo, recuperamos el que ya tenía la BD
-                                current_lang = row[0]
+                            # Si no está eligiendo idioma, mantenemos el que tiene
+                            current_lang = db_lang
         
-                        return current_lang
+                    cursor.close()
+                    CONN.close()
+                    return current_lang
         
-            except Exception as e:
-                print("❌ Error en manage_user_language:", e)
-                return "es" # Retorno seguro en caso de fallo crítico
-            finally:
-                CONN.close()
+                except Exception as e:
+                    print(f"❌ DB ERROR CRÍTICO: {e}")
+                    if CONN: CONN.rollback()
+                    return "es"

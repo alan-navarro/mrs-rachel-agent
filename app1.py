@@ -215,7 +215,7 @@ bp = "\n"*3
 def whatsapp_webhook():
     # --- CHIVATO DE DEPLOY ---
     print("\n" + "="*30)
-    print("⚡ VERSIÓN: FIX UNBOUND LOCAL ERROR ⚡")
+    print("⚡ VERSIÓN: PERSISTENCIA TOTAL IDIOMA + STEP ⚡")
     print("="*30 + "\n")
 
     data = request.form.to_dict()
@@ -223,34 +223,33 @@ def whatsapp_webhook():
     message_text = data.get("Body", "").strip()
     num_media = int(data.get("NumMedia", 0))
 
-    # 1. INICIALIZACIÓN SEGURA (Esto arregla tu error 500)
-    # Definimos lang y user por defecto ANTES de cualquier lógica
+    # 1. RECUPERACIÓN DE ESTADO INICIAL
     user = get_user(from_number_clean)
     if not user:
         user = {"lang": "es", "step": "LANG"}
     
-    # Asignamos un valor por defecto para evitar el UnboundLocalError
     lang = user.get("lang") or "es" 
 
-    # 2. LÓGICA DE BASE DE DATOS
+    # 2. LÓGICA DE BASE DE DATOS (Sincronización de idioma y avance de paso)
     try:
         new_lang_selection = None
+        # Si el usuario está en el paso de elegir idioma
         if user.get("step") == "LANG":
             mapping = {"1": "es", "2": "en", "3": "fr"}
             new_lang_selection = mapping.get(message_text)
 
-        # Consultamos la BD
+        # La función manage_user_language ahora también debe actualizar el STEP a 'WELCOME'
+        # si recibe un new_lang_selection válido.
         db_lang = PullShopify().manage_user_language(from_number_clean, new_lang_selection)
         
-        # Actualizamos la variable lang con lo que dijo la BD
         if db_lang != "undefined":
             lang = db_lang
+            # Si acaba de seleccionar idioma, actualizamos el objeto local para esta ejecución
+            if new_lang_selection:
+                user["step"] = "WELCOME"
             
-        # Sincronizamos el diccionario user
         user["lang"] = lang
-        
-        # AHORA SÍ es seguro imprimir, porque lang ya existe
-        print(f"DEBUG: Idioma recuperado de BD para {from_number_clean} es {lang}")
+        print(f"DEBUG: Idioma recuperado de BD para {from_number_clean} es {lang} | Step: {user.get('step')}")
 
     except Exception as e:
         print(f"⚠️ Error recuperando idioma de BD: {e}. Usando fallback: {lang}")
@@ -266,7 +265,7 @@ def whatsapp_webhook():
             try:
                 recovered_phone = PullShopify().confirm_discount_code(code_id)
                 
-                # Buscamos idioma del cliente
+                # Consultamos idioma del cliente en la BD
                 c_lang_db = PullShopify().manage_user_language(str(recovered_phone))
                 c_lang = "es" if c_lang_db == "undefined" else c_lang_db
 
@@ -283,7 +282,7 @@ def whatsapp_webhook():
                 tw_client.messages.create(from_=tw_from, to=tw_to, body=f"🎫 *{new_coupon}*")
                 tw_client.messages.create(from_=tw_from, to=tw_to, body=RESPONSES["END"][c_lang])
                 
-                print(f"✅ Cupón {new_coupon} enviado a {recovered_phone}")
+                print(f"✅ Cupón {new_coupon} enviado a {recovered_phone} en {c_lang}")
             except Exception as e:
                 print(f"❌ ERROR ADMIN: {e}")
         return "OK", 200
@@ -292,6 +291,7 @@ def whatsapp_webhook():
     # LÓGICA PARA EL CLIENTE
     # ------------------------------------------------
     
+    # Manejo de imágenes (Transferencias)
     if num_media > 0:
         discount_id = "N/A"
         try:
@@ -301,34 +301,44 @@ def whatsapp_webhook():
         threading.Thread(target=AutoMessagingResponse().forward_media_to_admin, 
                          args=(from_number_clean, num_media, data, discount_id)).start()
 
+        # Determinamos la llave de respuesta
         msg_key = "TRANSFER_PROOF_RECEIVED" if user.get("step") == "WAITING_TRANSFER_PROOF" else "WELCOME"
-        resp.message(RESPONSES.get(msg_key, {}).get(lang, "Gracias.")) # lang ya es seguro aquí
+        
+        # Buscamos la traducción o fallback
+        texto_media = RESPONSES.get(msg_key, {}).get(lang, RESPONSES.get(msg_key, {}).get("es", "Gracias."))
+        resp.message(texto_media)
+        
         user["step"] = "WAITING_ADMIN_CONFIRMATION"
         return str(resp), 200
 
+    # Manejo de texto normal
     try:
-        # Pasamos el user actualizado (que ya tiene el lang de la BD)
         key = route_message(message_text, user)
         
-        # Re-verificamos lang por si route_message lo cambió internamente
+        # Sincronizamos idioma por si cambió en route_message
         lang = user.get("lang", lang)
 
         if not key or key not in RESPONSES:
             key = "WELCOME"
             
+        # Obtenemos texto traducido
         texto_final = RESPONSES[key].get(lang, RESPONSES[key].get("es", "Hola"))
         resp.message(texto_final)
 
         if key == "TRANSFER":
             PullShopify().first_entry_into_discount_codes(from_number_clean, datetime.now())
-            resp.message(RESPONSES.get("TRANSFER_FOLLOWUP", {}).get(lang, "..."))
+            
+            # Mensaje de seguimiento traducido
+            follow_up = RESPONSES.get("TRANSFER_FOLLOWUP", {}).get(lang, RESPONSES.get("TRANSFER_FOLLOWUP", {}).get("es", "..."))
+            resp.message(follow_up)
+            
             user["step"] = "WAITING_TRANSFER_PROOF"
         elif key == "END":
             reset_user(from_number_clean)
 
     except Exception as e:
         print(f"💥 Error Webhook Texto: {e}")
-        resp.message("Error técnico. Reintenta.")
+        resp.message("Lo siento, hubo un error. Intenta de nuevo.")
 
     return str(resp), 200
 
