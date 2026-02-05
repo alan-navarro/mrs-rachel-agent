@@ -232,7 +232,7 @@ def whatsapp_webhook():
 
     # Consultamos/Actualizamos la BD
     db_lang = PullShopify().manage_user_language(from_number_clean, new_lang_selection)
-    
+    print(f"DEBUG: Idioma recuperado de BD para {from_number_clean} es {lang}")
     # Normalizamos el idioma (si es undefined -> español)
     lang = "es" if db_lang == "undefined" else db_lang
     
