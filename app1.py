@@ -218,61 +218,69 @@ def whatsapp_webhook():
     message_text = data.get("Body", "").strip()
     num_media = int(data.get("NumMedia", 0))
     
-    # 1. SEGURIDAD DE IDIOMA: Nunca permitir que sea None
+    # 1. RECUPERACIÓN DE ESTADO E IDIOMA DESDE BD
     user = get_user(from_number_clean)
     if not user:
         user = {"lang": "es", "step": "LANG"}
+
+    # Lógica para detectar si el cliente está eligiendo idioma justo ahora
+    new_lang_selection = None
+    if user.get("step") == "LANG":
+        mapping = {"1": "es", "2": "en", "3": "fr"}
+        new_lang_selection = mapping.get(message_text)
+
+    # LLAMADA CRÍTICA: Sincronizar con la tabla chatbot_interaction
+    # PullShopify().manage_user_language maneja el insert inicial (undefined) o el update
+    db_lang = PullShopify().manage_user_language(from_number_clean, new_lang_selection)
     
-    lang = user.get("lang") or "es"
-    if lang not in ["es", "en", "fr"]: lang = "es"
+    # 2. SEGURIDAD DE IDIOMA: Si la BD dice 'undefined', usamos 'es' para no romper RESPONSES
+    lang = "es" if db_lang == "undefined" else db_lang
+    user["lang"] = lang  # Sincronizamos el diccionario para route_message
 
     resp = MessagingResponse()
 
     # ------------------------------------------------
-    # LÓGICA ADMIN: ENVÍO DE CÓDIGO (EL PUNTO CRÍTICO)
+    # LÓGICA PARA EL ADMIN (Confirmación de Pagos)
     # ------------------------------------------------
     if from_number_clean == ADMIN_NUMBER:
         if message_text.isdigit():
             code_id = int(message_text)
             try:
-                # Recuperar datos
+                # Recuperar teléfono del cliente
                 recovered_phone = PullShopify().confirm_discount_code(code_id)
-                client_user = get_user(str(recovered_phone))
-                c_lang = client_user.get("lang") or "es"
+                
+                # Obtener el idioma que el cliente guardó en su interacción
+                # Usamos la nueva función para saber qué idioma le gusta a este cliente
+                c_lang_db = PullShopify().manage_user_language(str(recovered_phone))
+                c_lang = "es" if c_lang_db == "undefined" else c_lang_db
 
-                # Intentar crear cupón en Shopify
-                # NOTA: Si esto falla, el código saltará al except y no enviará mensajes
+                # Generar cupón
                 out = PullShopify().make_100pct_discount(prefix="FREE100", usage_limit=1)
                 new_coupon = out.get("discount_code", "ERROR_GEN")
-                
                 PullShopify().update_discount_code_by_id(code_id, new_coupon)
 
-                # Envío de mensajes (USANDO UN CLIENTE NUEVO PARA ASEGURAR ENTREGA)
+                # Cliente Twilio para notificar fuera del flujo del Webhook
                 from twilio.rest import Client
                 tw_client = Client(os.environ["TWILIO_SID"], os.environ["TWILIO_TOKEN"])
                 tw_from = f"whatsapp:+{SENDER_NUMBER}"
                 tw_to = f"whatsapp:+{recovered_phone}"
                 
-                # Mensaje 1: Confirmación
                 tw_client.messages.create(from_=tw_from, to=tw_to, body=RESPONSES["PAYMENT_CONFIRMED"][c_lang])
-                # Mensaje 2: EL CUPÓN (Si no llega, es por Shopify)
                 tw_client.messages.create(from_=tw_from, to=tw_to, body=f"🎫 *{new_coupon}*")
-                # Mensaje 3: Despedida
                 tw_client.messages.create(from_=tw_from, to=tw_to, body=RESPONSES["END"][c_lang])
                 
-                print(f"✅ Cupón {new_coupon} enviado a {recovered_phone}")
+                print(f"✅ Cupón {new_coupon} enviado a {recovered_phone} en idioma: {c_lang}")
 
             except Exception as e:
-                print(f"❌ ERROR CRÍTICO EN ENVÍO DE CUPÓN: {e}")
-                # Opcional: Notificar al admin que hubo un error técnico
+                print(f"❌ ERROR EN ENVÍO DE CUPÓN: {e}")
         
         return "OK", 200
 
     # ------------------------------------------------
-    # LÓGICA CLIENTE: FLUJO DE CONVERSACIÓN
+    # LÓGICA PARA EL CLIENTE (Flujo normal)
     # ------------------------------------------------
     
-    # Manejo de imágenes (Con Thread para no bloquear)
+    # Manejo de imágenes (Thread para evitar reintentos de Twilio)
     if num_media > 0:
         discount_id = "N/A"
         try:
@@ -290,10 +298,10 @@ def whatsapp_webhook():
     # Manejo de texto normal
     try:
         key = route_message(message_text, user)
-        # Si route_message devuelve algo raro o None, forzamos menú
         if not key or key not in RESPONSES:
             key = "WELCOME"
             
+        # Obtenemos la respuesta en el idioma recuperado de la BD
         texto_final = RESPONSES[key].get(lang, RESPONSES[key].get("es", "Hola"))
         resp.message(texto_final)
 
