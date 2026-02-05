@@ -218,48 +218,47 @@ def whatsapp_webhook():
     message_text = data.get("Body", "").strip()
     num_media = int(data.get("NumMedia", 0))
     
-    # 1. RECUPERACIÓN DE ESTADO E IDIOMA DESDE BD
+    # 1. RECUPERACIÓN DE ESTADO (MEMORIA)
     user = get_user(from_number_clean)
     if not user:
         user = {"lang": "es", "step": "LANG"}
 
-    # Lógica para detectar si el cliente está eligiendo idioma justo ahora
+    # 2. SINCRONIZACIÓN DE IDIOMA (BD - FUENTE DE VERDAD)
     new_lang_selection = None
+    # Si el usuario está en paso de elegir idioma, capturamos su selección
     if user.get("step") == "LANG":
         mapping = {"1": "es", "2": "en", "3": "fr"}
         new_lang_selection = mapping.get(message_text)
 
-    # LLAMADA CRÍTICA: Sincronizar con la tabla chatbot_interaction
-    # PullShopify().manage_user_language maneja el insert inicial (undefined) o el update
+    # Consultamos/Actualizamos la BD
     db_lang = PullShopify().manage_user_language(from_number_clean, new_lang_selection)
     
-    # 2. SEGURIDAD DE IDIOMA: Si la BD dice 'undefined', usamos 'es' para no romper RESPONSES
+    # Normalizamos el idioma (si es undefined -> español)
     lang = "es" if db_lang == "undefined" else db_lang
-    user["lang"] = lang  # Sincronizamos el diccionario para route_message
+    
+    # IMPORTANTE: Forzamos el idioma en el diccionario 'user' 
+    # para que route_message y RESPONSES lo usen correctamente
+    user["lang"] = lang 
 
     resp = MessagingResponse()
 
     # ------------------------------------------------
-    # LÓGICA PARA EL ADMIN (Confirmación de Pagos)
+    # LÓGICA PARA EL ADMIN
     # ------------------------------------------------
     if from_number_clean == ADMIN_NUMBER:
         if message_text.isdigit():
             code_id = int(message_text)
             try:
-                # Recuperar teléfono del cliente
                 recovered_phone = PullShopify().confirm_discount_code(code_id)
                 
-                # Obtener el idioma que el cliente guardó en su interacción
-                # Usamos la nueva función para saber qué idioma le gusta a este cliente
+                # Buscamos el idioma del cliente en la BD
                 c_lang_db = PullShopify().manage_user_language(str(recovered_phone))
                 c_lang = "es" if c_lang_db == "undefined" else c_lang_db
 
-                # Generar cupón
                 out = PullShopify().make_100pct_discount(prefix="FREE100", usage_limit=1)
                 new_coupon = out.get("discount_code", "ERROR_GEN")
                 PullShopify().update_discount_code_by_id(code_id, new_coupon)
 
-                # Cliente Twilio para notificar fuera del flujo del Webhook
                 from twilio.rest import Client
                 tw_client = Client(os.environ["TWILIO_SID"], os.environ["TWILIO_TOKEN"])
                 tw_from = f"whatsapp:+{SENDER_NUMBER}"
@@ -270,17 +269,16 @@ def whatsapp_webhook():
                 tw_client.messages.create(from_=tw_from, to=tw_to, body=RESPONSES["END"][c_lang])
                 
                 print(f"✅ Cupón {new_coupon} enviado a {recovered_phone} en idioma: {c_lang}")
-
             except Exception as e:
                 print(f"❌ ERROR EN ENVÍO DE CUPÓN: {e}")
         
         return "OK", 200
 
     # ------------------------------------------------
-    # LÓGICA PARA EL CLIENTE (Flujo normal)
+    # LÓGICA PARA EL CLIENTE
     # ------------------------------------------------
     
-    # Manejo de imágenes (Thread para evitar reintentos de Twilio)
+    # Manejo de imágenes
     if num_media > 0:
         discount_id = "N/A"
         try:
@@ -295,13 +293,17 @@ def whatsapp_webhook():
         user["step"] = "WAITING_ADMIN_CONFIRMATION"
         return str(resp), 200
 
-    # Manejo de texto normal
+    # Manejo de texto
     try:
+        # Aquí 'user' ya lleva el 'lang' correcto inyectado desde la BD
         key = route_message(message_text, user)
+        
+        # Si route_message cambió el idioma internamente, lo respetamos
+        lang = user.get("lang", lang)
+
         if not key or key not in RESPONSES:
             key = "WELCOME"
             
-        # Obtenemos la respuesta en el idioma recuperado de la BD
         texto_final = RESPONSES[key].get(lang, RESPONSES[key].get("es", "Hola"))
         resp.message(texto_final)
 
