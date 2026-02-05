@@ -213,117 +213,100 @@ bp = "\n"*3
 
 @app.route("/webhook_whatsapp", methods=["POST"])
 def whatsapp_webhook():
-    # 1. Extracción de datos inicial
     data = request.form.to_dict()
-    get_from_number = data.get("From", "")
-    from_number_clean = get_from_number.replace("whatsapp:+", "")
+    from_number_clean = data.get("From", "").replace("whatsapp:+", "")
     message_text = data.get("Body", "").strip()
     num_media = int(data.get("NumMedia", 0))
     
-    # 2. Cargar estado del usuario con blindaje para lang
+    # 1. SEGURIDAD DE IDIOMA: Nunca permitir que sea None
     user = get_user(from_number_clean)
     if not user:
-        user = {"lang": "es", "step": "LANG"} # Estado inicial si no existe
+        user = {"lang": "es", "step": "LANG"}
     
-    lang = user.get("lang")
-    if not lang or lang not in ["es", "en", "fr"]:
-        lang = "es"
+    lang = user.get("lang") or "es"
+    if lang not in ["es", "en", "fr"]: lang = "es"
 
     resp = MessagingResponse()
-    created_at = datetime.now()
-
-    # LOG DE ENTRADA
-    print(f"{bp}--- NUEVO MENSAJE ---{bp}De: {from_number_clean}{bp}Texto: {message_text}{bp}Media: {num_media}{bp}")
 
     # ------------------------------------------------
-    # LÓGICA PARA EL ADMIN
+    # LÓGICA ADMIN: ENVÍO DE CÓDIGO (EL PUNTO CRÍTICO)
     # ------------------------------------------------
     if from_number_clean == ADMIN_NUMBER:
         if message_text.isdigit():
             code_id = int(message_text)
-            print(f"🔎 Admin intentando confirmar ID: {code_id}")
-            
             try:
+                # Recuperar datos
                 recovered_phone = PullShopify().confirm_discount_code(code_id)
                 client_user = get_user(str(recovered_phone))
-                c_lang = client_user.get("lang", "es")
+                c_lang = client_user.get("lang") or "es"
 
+                # Intentar crear cupón en Shopify
+                # NOTA: Si esto falla, el código saltará al except y no enviará mensajes
                 out = PullShopify().make_100pct_discount(prefix="FREE100", usage_limit=1)
-                PullShopify().update_discount_code_by_id(code_id, out["discount_code"])
+                new_coupon = out.get("discount_code", "ERROR_GEN")
+                
+                PullShopify().update_discount_code_by_id(code_id, new_coupon)
 
-                # Cliente Twilio para notificaciones directas
+                # Envío de mensajes (USANDO UN CLIENTE NUEVO PARA ASEGURAR ENTREGA)
                 from twilio.rest import Client
-                client_twilio = Client(os.environ["TWILIO_SID"], os.environ["TWILIO_TOKEN"])
-                from_twilio = f"whatsapp:+{SENDER_NUMBER}"
-                to_client = f"whatsapp:+{recovered_phone}"
+                tw_client = Client(os.environ["TWILIO_SID"], os.environ["TWILIO_TOKEN"])
+                tw_from = f"whatsapp:+{SENDER_NUMBER}"
+                tw_to = f"whatsapp:+{recovered_phone}"
                 
-                client_twilio.messages.create(from_=from_twilio, to=to_client, body=RESPONSES["PAYMENT_CONFIRMED"][c_lang])
-                client_twilio.messages.create(from_=from_twilio, to=to_client, body=f"🎫 *{out['discount_code']}*")
-                client_twilio.messages.create(from_=from_twilio, to=to_client, body=RESPONSES["END"][c_lang])
+                # Mensaje 1: Confirmación
+                tw_client.messages.create(from_=tw_from, to=tw_to, body=RESPONSES["PAYMENT_CONFIRMED"][c_lang])
+                # Mensaje 2: EL CUPÓN (Si no llega, es por Shopify)
+                tw_client.messages.create(from_=tw_from, to=tw_to, body=f"🎫 *{new_coupon}*")
+                # Mensaje 3: Despedida
+                tw_client.messages.create(from_=tw_from, to=tw_to, body=RESPONSES["END"][c_lang])
                 
-                print(f"✅ Pago confirmado para el cliente {recovered_phone}")
+                print(f"✅ Cupón {new_coupon} enviado a {recovered_phone}")
+
             except Exception as e:
-                print(f"⚠️ Error al procesar confirmación de Admin: {e}")
+                print(f"❌ ERROR CRÍTICO EN ENVÍO DE CUPÓN: {e}")
+                # Opcional: Notificar al admin que hubo un error técnico
         
         return "OK", 200
 
     # ------------------------------------------------
-    # LÓGICA PARA EL CLIENTE
+    # LÓGICA CLIENTE: FLUJO DE CONVERSACIÓN
     # ------------------------------------------------
-
-    # CASO A: SI ENVÍA UNA IMAGEN (COMPROBANTE)
+    
+    # Manejo de imágenes (Con Thread para no bloquear)
     if num_media > 0:
+        discount_id = "N/A"
         try:
             discount_id = PullShopify().get_latest_id_for_phone(from_number_clean)
-            
-            # 🚀 CAMBIO CLAVE: Usamos un Hilo (Thread) para el proceso pesado de S3
-            # Esto permite responderle a Twilio de inmediato y evitar que repita el mensaje
-            threading.Thread(
-                target=AutoMessagingResponse().forward_media_to_admin, 
-                args=(from_number_clean, num_media, data, discount_id)
-            ).start()
+        except: pass
 
-            # Respondemos al cliente de inmediato
-            msg_key = "TRANSFER_PROOF_RECEIVED" if user.get("step") == "WAITING_TRANSFER_PROOF" else "WELCOME"
-            texto = RESPONSES.get(msg_key, {}).get(lang, "Gracias, hemos recibido tu archivo.")
-            resp.message(texto)
-            
-            user["step"] = "WAITING_ADMIN_CONFIRMATION"
-            
-        except Exception as e:
-            print(f"❌ Error en flujo de media: {e}")
-            resp.message("Hubo un detalle al procesar tu imagen, pero la estamos revisando.")
-            
+        threading.Thread(target=AutoMessagingResponse().forward_media_to_admin, 
+                         args=(from_number_clean, num_media, data, discount_id)).start()
+
+        msg_key = "TRANSFER_PROOF_RECEIVED" if user.get("step") == "WAITING_TRANSFER_PROOF" else "WELCOME"
+        resp.message(RESPONSES.get(msg_key, {}).get(lang, "Gracias por tu mensaje."))
+        user["step"] = "WAITING_ADMIN_CONFIRMATION"
         return str(resp), 200
 
-    # CASO B: MENSAJE DE TEXTO NORMAL
+    # Manejo de texto normal
     try:
         key = route_message(message_text, user)
-        
-        # Blindaje contra KeyError: None o llaves inexistentes
-        if key and key in RESPONSES:
-            texto_respuesta = RESPONSES[key].get(lang, RESPONSES[key].get("es", "Error de traducción"))
-        else:
-            # Si no hay match, regresamos al menú o enviamos mensaje de error
-            texto_respuesta = RESPONSES.get("WELCOME", {}).get(lang, "Hola, ¿cómo puedo ayudarte?")
+        # Si route_message devuelve algo raro o None, forzamos menú
+        if not key or key not in RESPONSES:
+            key = "WELCOME"
             
-        resp.message(texto_respuesta)
+        texto_final = RESPONSES[key].get(lang, RESPONSES[key].get("es", "Hola"))
+        resp.message(texto_final)
 
-        # Acciones post-respuesta según la key
         if key == "TRANSFER":
-            PullShopify().first_entry_into_discount_codes(from_number_clean, created_at)
-            # Intentamos enviar el seguimiento de transferencia
-            followup = RESPONSES.get("TRANSFER_FOLLOWUP", {}).get(lang, "")
-            if followup:
-                resp.message(followup)
+            PullShopify().first_entry_into_discount_codes(from_number_clean, datetime.now())
+            resp.message(RESPONSES.get("TRANSFER_FOLLOWUP", {}).get(lang, "..."))
             user["step"] = "WAITING_TRANSFER_PROOF"
-
         elif key == "END":
             reset_user(from_number_clean)
 
     except Exception as e:
-        print(f"💥 Error crítico: {e}")
-        resp.message("Lo siento, tuve un pequeño error. ¿Podrías intentar de nuevo?")
+        print(f"💥 Error en texto: {e}")
+        resp.message("Lo siento, por favor intenta de nuevo en unos segundos.")
 
     return str(resp), 200
 
